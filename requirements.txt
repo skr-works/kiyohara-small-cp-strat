@@ -1,0 +1,7 @@
+gspread
+oauth2client
+yfinance
+requests
+beautifulsoup4
+jpholiday
+pandas
