@@ -13,7 +13,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import traceback # デバッグ用に追加
+import traceback
 
 # --- 設定・定数 ---
 SECRETS_JSON_ENV = 'GCP_CREDENTIALS_JSON'
@@ -21,7 +21,7 @@ MARKET_CAP_THRESHOLD = 500 * 100_000_000
 INVENTORY_RATIO_THRESHOLD = 0.3
 FINANCE_KEYWORDS = ["銀行業", "保険業", "証券", "商品先物", "金融業"]
 
-# ヘッダー定義 (B列以降の書き込み用)
+# ヘッダー定義
 HEADER = [
     '銘柄名', '業種', 'NC比率', 'NC比率1倍超', '金融除外フラグ', 
     '時価総額(億)', '小型株フラグ', '棚卸資産警告', '棚卸資産比率', 
@@ -32,6 +32,7 @@ HEADER = [
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
 # Session作成
@@ -65,7 +66,7 @@ def get_yahoo_jp_info(ticker_code):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     
     try:
-        time.sleep(random.uniform(0.05, 0.9))
+        time.sleep(random.uniform(0.05, 0.5))
         res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -78,43 +79,39 @@ def get_yahoo_jp_info(ticker_code):
         elif title_text:
             name = title_text.split("：")[0]
 
-        # 2. 業種取得
+        # 2. 業種取得 (修正: hrefに /industry/ を含むaタグを探す)
         industry = "取得失敗"
-        target_el = soup.find(lambda tag: tag.name == "span" and "業種" in tag.text)
-        if target_el:
-            parent = target_el.parent
-            industry_tag = parent.find("a")
-            if industry_tag:
-                industry = industry_tag.text.strip()
-            else:
-                industry = parent.text.replace("業種", "").strip()
+        industry_tag = soup.find("a", href=lambda h: h and "/industry/" in h)
+        
+        if industry_tag:
+            industry = industry_tag.text.strip()
         else:
-            # デバッグ用出力
-            print(f"[DEBUG] Industry tag not found for {ticker_code}. Title: {title_text[:20]}...")
+            # フォールバック: 以前のロジック
+            target_el = soup.find(lambda tag: tag.name == "span" and "業種" in tag.text)
+            if target_el:
+                parent = target_el.parent
+                industry_tag_old = parent.find("a")
+                if industry_tag_old:
+                    industry = industry_tag_old.text.strip()
 
         return name.strip() if name else None, industry.strip()
 
     except Exception as e:
-        print(f"[DEBUG] Scraping Error for {ticker_code}: {e}")
+        print(f"Scraping Error for {ticker_code}: {e}")
         return None, "取得失敗"
 
 def get_financial_data(ticker_code, jp_name_failed=False):
     """yfinanceから財務データを取得して計算"""
-    # ここでの ticker_code は既に整形済みであること
     target_ticker = f"{ticker_code}.T"
     yf_ticker = yf.Ticker(target_ticker)
     
     fallback_name = None
 
     try:
-        # デバッグ: 接続確認
-        # print(f"[DEBUG] Fetching yfinance for: {target_ticker}")
-
         # 404エラーチェック
         try:
              _ = yf_ticker.fast_info.currency
         except Exception as e:
-             print(f"[DEBUG] {target_ticker} Not Found or 404: {e}")
              return {'status': 'DATA_MISSING'}
 
         # 時価総額
@@ -134,7 +131,6 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         # BS取得
         bs = yf_ticker.balance_sheet
         if bs.empty:
-            print(f"[DEBUG] {target_ticker} Balance Sheet is EMPTY.")
             return None
 
         latest_date = bs.columns[0]
@@ -149,8 +145,9 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                     return float(val)
             return None
 
-        # 項目取得
-        total_assets_curr = get_val(['Total Current Assets'])
+        # 修正: 'Total Current Assets' がない場合 'Current Assets' を探す
+        total_assets_curr = get_val(['Total Current Assets', 'Current Assets'])
+        
         total_liab = get_val(['Total Liabilities Net Minority Interest', 'Total Liabilities'])
         inventory = get_val(['Inventory']) or 0.0
         
@@ -161,7 +158,7 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         
         # 欠損チェック
         if market_cap is None or total_assets_curr is None or total_liab is None:
-            print(f"[DEBUG] {target_ticker} Missing essential data. MC:{market_cap}, Assets:{total_assets_curr}, Liab:{total_liab}")
+            # print(f"Missing essential data {ticker_code}: MC:{market_cap}, A:{total_assets_curr}, L:{total_liab}")
             return {
                 'market_cap': market_cap,
                 'status': 'DATA_MISSING',
@@ -187,13 +184,11 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         }
 
     except Exception as e:
-        # 修正: エラー詳細を表示
-        print(f"[DEBUG] yfinance Critical Error for {target_ticker}: {e}")
-        # traceback.print_exc() # 必要ならコメントアウト解除
+        print(f"yfinance Error {ticker_code}: {e}")
         return {'status': 'ERROR'}
 
 def process_ticker_wrapper(code_raw):
-    # 修正: 文字列変換と ".0" の除去 (スプシから数値が来ると "1301.0" になる対策)
+    # 文字列変換と ".0" の除去
     code_str = str(code_raw).strip()
     if code_str.endswith(".0"):
         code_str = code_str[:-2]
@@ -239,8 +234,6 @@ def process_ticker_wrapper(code_raw):
         row_data[13] = fin_data['inventory']
     
     else:
-        # デバッグ: 失敗時はコンソールにも出す
-        print(f"[DEBUG] {code_str} Failed to get valid data. Name:{final_name}")
         row_data[0] = final_name if final_name != "取得失敗" else "データ取得失敗"
         row_data[2] = "ERROR/MISSING"
 
@@ -290,7 +283,6 @@ def main():
         print(f"Processing batch: {current_index + 1} - {end_index} / {total_tickers}")
         
         batch_rows = []
-        # デバッグのため max_workers を減らすことも検討したが、まずはプリントで確認
         with ThreadPoolExecutor(max_workers=4) as executor:
             results = executor.map(process_ticker_wrapper, batch_tickers)
             batch_rows = list(results)
