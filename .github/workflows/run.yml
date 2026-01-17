@@ -1,0 +1,56 @@
+name: Screener Routine
+
+on:
+  schedule:
+    # JST 15:32 (UTC 06:32) Mon-Fri
+    - cron: '32 6 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # 無限ループ防止
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 履歴取得（50日判定用）
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Screener Script
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+        run: python main.py
+
+      - name: Keep-alive commit (Avoid 60-day disable)
+        shell: bash
+        run: |
+          # 最終コミット日時(UnixTimestamp)を取得
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          CURRENT_TS=$(date +%s)
+          DIFF_SEC=$((CURRENT_TS - LAST_COMMIT_TS))
+          DIFF_DAYS=$((DIFF_SEC / 86400))
+          
+          echo "Last commit was $DIFF_DAYS days ago."
+
+          if [ "$DIFF_DAYS" -ge 50 ]; then
+            echo "More than 50 days. Committing empty change to keep workflow active."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Automatic keep-alive commit to prevent workflow suspension"
+            git push
+          else
+            echo "Less than 50 days. No action needed."
+          fi
