@@ -21,11 +21,21 @@ MARKET_CAP_THRESHOLD = 500 * 100_000_000
 INVENTORY_RATIO_THRESHOLD = 0.3
 FINANCE_KEYWORDS = ["銀行業", "保険業", "証券", "商品先物", "金融業"]
 
-# ヘッダー定義
+# 東証33業種リスト (参照コードより追加)
+TSE_SECTORS = [
+    "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
+    "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
+    "金属製品", "機械", "電気機器", "輸送用機器", "精密機器", "その他製品",
+    "電気・ガス業", "陸運業", "海運業", "空運業", "倉庫・運輸関連業", "情報・通信業",
+    "卸売業", "小売業", "銀行業", "証券、商品先物取引業", "保険業",
+    "その他金融業", "不動産業", "サービス業"
+]
+
+# ヘッダー定義 (単位変更に伴い名称修正)
 HEADER = [
     '銘柄名', '業種', 'NC比率', 'NC比率1倍超', '金融除外フラグ', 
     '時価総額(億)', '小型株フラグ', '棚卸資産警告', '棚卸資産比率', 
-    '流動資産', '投資有価証券', '負債合計', 'ネットキャッシュ', '棚卸資産'
+    '流動資産(億)', '投資有価証券(億)', '負債合計(億)', 'ネットキャッシュ(億)', '棚卸資産(億)'
 ]
 
 # User-Agentリスト
@@ -61,7 +71,7 @@ def is_market_closed():
     return False
 
 def get_yahoo_jp_info(ticker_code):
-    """Yahoo!ファイナンス(JP)から銘柄名と業種をスクレイピング"""
+    """Yahoo!ファイナンス(JP)から銘柄名と業種を取得 (リスト照合方式に変更)"""
     url = f"https://finance.yahoo.co.jp/quote/{ticker_code}.T"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     
@@ -69,9 +79,13 @@ def get_yahoo_jp_info(ticker_code):
         time.sleep(random.uniform(0.05, 0.5))
         res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
         res.raise_for_status()
-        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # HTMLテキスト全体を取得
+        res.encoding = res.apparent_encoding
+        html = res.text
+        soup = BeautifulSoup(html, 'html.parser')
 
-        # 1. 銘柄名取得
+        # 1. 銘柄名取得 (Titleタグから抽出)
         title_text = soup.title.string if soup.title else ""
         name = None
         if "【" in title_text:
@@ -79,22 +93,15 @@ def get_yahoo_jp_info(ticker_code):
         elif title_text:
             name = title_text.split("：")[0]
 
-        # 2. 業種取得 (修正: hrefに /industry/ を含むaタグを探す)
+        # 2. 業種取得 (修正: HTML全体から東証33業種リストに含まれるものを探す)
         industry = "取得失敗"
-        industry_tag = soup.find("a", href=lambda h: h and "/industry/" in h)
-        
-        if industry_tag:
-            industry = industry_tag.text.strip()
-        else:
-            # フォールバック: 以前のロジック
-            target_el = soup.find(lambda tag: tag.name == "span" and "業種" in tag.text)
-            if target_el:
-                parent = target_el.parent
-                industry_tag_old = parent.find("a")
-                if industry_tag_old:
-                    industry = industry_tag_old.text.strip()
+        for candidate in TSE_SECTORS:
+            # HTML内に候補文字列が含まれているかチェック
+            if candidate in html:
+                industry = candidate
+                break
 
-        return name.strip() if name else None, industry.strip()
+        return name.strip() if name else None, industry
 
     except Exception as e:
         print(f"Scraping Error for {ticker_code}: {e}")
@@ -145,7 +152,7 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                     return float(val)
             return None
 
-        # 修正: 'Total Current Assets' がない場合 'Current Assets' を探す
+        # 'Total Current Assets' がない場合 'Current Assets' を探す
         total_assets_curr = get_val(['Total Current Assets', 'Current Assets'])
         
         total_liab = get_val(['Total Liabilities Net Minority Interest', 'Total Liabilities'])
@@ -158,7 +165,6 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         
         # 欠損チェック
         if market_cap is None or total_assets_curr is None or total_liab is None:
-            # print(f"Missing essential data {ticker_code}: MC:{market_cap}, A:{total_assets_curr}, L:{total_liab}")
             return {
                 'market_cap': market_cap,
                 'status': 'DATA_MISSING',
@@ -196,7 +202,7 @@ def process_ticker_wrapper(code_raw):
     if not code_str:
         return [""] * len(HEADER)
     
-    # A. Yahoo JP スクレイピング
+    # A. Yahoo JP スクレイピング (リスト照合版)
     name_jp, industry_jp = get_yahoo_jp_info(code_str)
     
     # B. yfinance データ取得
@@ -219,19 +225,24 @@ def process_ticker_wrapper(code_raw):
         is_small = fin_data['market_cap'] <= MARKET_CAP_THRESHOLD
         is_inv_red = fin_data['inv_ratio'] >= INVENTORY_RATIO_THRESHOLD
         is_nc_over_1 = fin_data['nc_ratio'] >= 1.0
+        
+        # 単位変換用 (億円)
+        to_oku = 100_000_000
 
         row_data[2] = round(fin_data['nc_ratio'], 2)
         row_data[3] = is_nc_over_1
         row_data[4] = is_exclude_fin
-        row_data[5] = round(fin_data['market_cap'] / 1e8, 1)
+        row_data[5] = round(fin_data['market_cap'] / to_oku, 1) # 時価総額(億)
         row_data[6] = is_small
         row_data[7] = is_inv_red
         row_data[8] = f"{fin_data['inv_ratio']:.2%}"
-        row_data[9] = fin_data['total_current_assets']
-        row_data[10] = fin_data['investment_securities']
-        row_data[11] = fin_data['total_liabilities']
-        row_data[12] = fin_data['net_cash']
-        row_data[13] = fin_data['inventory']
+        
+        # 修正: 以下の財務数値を億円単位に変換
+        row_data[9] = round(fin_data['total_current_assets'] / to_oku, 1)  # 流動資産(億)
+        row_data[10] = round(fin_data['investment_securities'] / to_oku, 1) # 投資有価証券(億)
+        row_data[11] = round(fin_data['total_liabilities'] / to_oku, 1)     # 負債合計(億)
+        row_data[12] = round(fin_data['net_cash'] / to_oku, 1)              # ネットキャッシュ(億)
+        row_data[13] = round(fin_data['inventory'] / to_oku, 1)             # 棚卸資産(億)
     
     else:
         row_data[0] = final_name if final_name != "取得失敗" else "データ取得失敗"
