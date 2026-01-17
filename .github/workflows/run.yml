@@ -2,9 +2,16 @@ name: Screener Routine
 
 on:
   schedule:
-    # JST 15:32 (UTC 06:32) Mon-Fri
     - cron: '32 6 * * 1-5'
+  # ▼▼▼ 修正: 手動実行時にオプションを追加 ▼▼▼
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even on holidays'
+        required: false
+        default: 'true'
+        type: boolean
+  # ▲▲▲ 修正ここまで ▲▲▲
 
 permissions:
   contents: write
@@ -12,13 +19,13 @@ permissions:
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # 無限ループ防止
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 履歴取得（50日判定用）
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,25 +39,11 @@ jobs:
       - name: Run Screener Script
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          # ▼▼▼ 追加: 入力値を環境変数として渡す（スケジュール実行時は空になる） ▼▼▼
+          FORCE_RUN: ${{ inputs.force_run }}
+          # ▲▲▲ 追加ここまで ▲▲▲
         run: python main.py
 
+      # (以下、Keep-alive commitのステップはそのまま)
       - name: Keep-alive commit (Avoid 60-day disable)
-        shell: bash
-        run: |
-          # 最終コミット日時(UnixTimestamp)を取得
-          LAST_COMMIT_TS=$(git log -1 --format=%ct)
-          CURRENT_TS=$(date +%s)
-          DIFF_SEC=$((CURRENT_TS - LAST_COMMIT_TS))
-          DIFF_DAYS=$((DIFF_SEC / 86400))
-          
-          echo "Last commit was $DIFF_DAYS days ago."
-
-          if [ "$DIFF_DAYS" -ge 50 ]; then
-            echo "More than 50 days. Committing empty change to keep workflow active."
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit --allow-empty -m "Automatic keep-alive commit to prevent workflow suspension"
-            git push
-          else
-            echo "Less than 50 days. No action needed."
-          fi
+        # ... (省略) ...
