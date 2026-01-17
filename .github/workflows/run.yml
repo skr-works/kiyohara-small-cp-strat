@@ -2,8 +2,8 @@ name: Screener Routine
 
 on:
   schedule:
+    # JST 15:32 (UTC 06:32) Mon-Fri
     - cron: '32 6 * * 1-5'
-  # ▼▼▼ 修正: 手動実行時にオプションを追加 ▼▼▼
   workflow_dispatch:
     inputs:
       force_run:
@@ -11,7 +11,6 @@ on:
         required: false
         default: 'true'
         type: boolean
-  # ▲▲▲ 修正ここまで ▲▲▲
 
 permissions:
   contents: write
@@ -39,11 +38,25 @@ jobs:
       - name: Run Screener Script
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          # ▼▼▼ 追加: 入力値を環境変数として渡す（スケジュール実行時は空になる） ▼▼▼
           FORCE_RUN: ${{ inputs.force_run }}
-          # ▲▲▲ 追加ここまで ▲▲▲
         run: python main.py
 
-      # (以下、Keep-alive commitのステップはそのまま)
       - name: Keep-alive commit (Avoid 60-day disable)
-        # ... (省略) ...
+        shell: bash
+        run: |
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          CURRENT_TS=$(date +%s)
+          DIFF_SEC=$((CURRENT_TS - LAST_COMMIT_TS))
+          DIFF_DAYS=$((DIFF_SEC / 86400))
+          
+          echo "Last commit was $DIFF_DAYS days ago."
+
+          if [ "$DIFF_DAYS" -ge 50 ]; then
+            echo "More than 50 days. Committing empty change to keep workflow active."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Automatic keep-alive commit to prevent workflow suspension"
+            git push
+          else
+            echo "Less than 50 days. No action needed."
+          fi
