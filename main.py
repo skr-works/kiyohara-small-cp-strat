@@ -21,7 +21,7 @@ MARKET_CAP_THRESHOLD = 500 * 100_000_000
 INVENTORY_RATIO_THRESHOLD = 0.3
 FINANCE_KEYWORDS = ["銀行業", "保険業", "証券", "商品先物", "金融業"]
 
-# 東証33業種リスト (参照コードより追加)
+# 東証33業種リスト
 TSE_SECTORS = [
     "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
     "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
@@ -31,11 +31,14 @@ TSE_SECTORS = [
     "その他金融業", "不動産業", "サービス業"
 ]
 
-# ヘッダー定義 (単位変更に伴い名称修正)
+# ヘッダー定義 (厳格NC関連を追加)
 HEADER = [
-    '銘柄名', '業種', 'NC比率', 'NC比率1倍超', '金融除外フラグ', 
-    '時価総額(億)', '小型株フラグ', '棚卸資産警告', '棚卸資産比率', 
-    '流動資産(億)', '投資有価証券(億)', '負債合計(億)', 'ネットキャッシュ(億)', '棚卸資産(億)'
+    '銘柄名', '業種', 
+    'NC比率', '厳格NC比率', 'NC比率1倍超', '厳格NC1倍超', 
+    '金融除外フラグ', '時価総額(億)', '小型株フラグ', 
+    '棚卸資産警告', '棚卸資産比率', 
+    '流動資産(億)', '投資有価証券(億)', '負債合計(億)', 
+    'ネットキャッシュ(億)', '厳格NC(億)', '棚卸資産(億)'
 ]
 
 # User-Agentリスト
@@ -93,7 +96,7 @@ def get_yahoo_jp_info(ticker_code):
         elif title_text:
             name = title_text.split("：")[0]
 
-        # 2. 業種取得 (修正: HTML全体から東証33業種リストに含まれるものを探す)
+        # 2. 業種取得 (HTML全体から東証33業種リストに含まれるものを探す)
         industry = "取得失敗"
         for candidate in TSE_SECTORS:
             # HTML内に候補文字列が含まれているかチェック
@@ -172,8 +175,20 @@ def get_financial_data(ticker_code, jp_name_failed=False):
             }
 
         # 計算
+        # 通常NetCash: 流動資産 + (投資有価証券 * 0.7) - 負債
         net_cash = total_assets_curr + (inv_securities * 0.7) - total_liab
-        nc_ratio = net_cash / market_cap if market_cap else 0
+        
+        # 厳格NetCash: (流動資産 - 棚卸資産) + (投資有価証券 * 0.7) - 負債
+        net_cash_strict = (total_assets_curr - inventory) + (inv_securities * 0.7) - total_liab
+
+        # 比率計算
+        if market_cap:
+            nc_ratio = net_cash / market_cap
+            nc_ratio_strict = net_cash_strict / market_cap
+        else:
+            nc_ratio = 0
+            nc_ratio_strict = 0
+
         inv_ratio = (inventory / total_assets_curr) if total_assets_curr else 0
 
         return {
@@ -184,7 +199,9 @@ def get_financial_data(ticker_code, jp_name_failed=False):
             'inventory': inventory,
             'investment_securities': inv_securities,
             'net_cash': net_cash,
+            'net_cash_strict': net_cash_strict, # 追加
             'nc_ratio': nc_ratio,
+            'nc_ratio_strict': nc_ratio_strict, # 追加
             'inv_ratio': inv_ratio,
             'fallback_name': fallback_name
         }
@@ -202,7 +219,7 @@ def process_ticker_wrapper(code_raw):
     if not code_str:
         return [""] * len(HEADER)
     
-    # A. Yahoo JP スクレイピング (リスト照合版)
+    # A. Yahoo JP スクレイピング
     name_jp, industry_jp = get_yahoo_jp_info(code_str)
     
     # B. yfinance データ取得
@@ -225,24 +242,28 @@ def process_ticker_wrapper(code_raw):
         is_small = fin_data['market_cap'] <= MARKET_CAP_THRESHOLD
         is_inv_red = fin_data['inv_ratio'] >= INVENTORY_RATIO_THRESHOLD
         is_nc_over_1 = fin_data['nc_ratio'] >= 1.0
+        is_nc_strict_over_1 = fin_data['nc_ratio_strict'] >= 1.0 # 追加
         
         # 単位変換用 (億円)
         to_oku = 100_000_000
 
         row_data[2] = round(fin_data['nc_ratio'], 2)
-        row_data[3] = is_nc_over_1
-        row_data[4] = is_exclude_fin
-        row_data[5] = round(fin_data['market_cap'] / to_oku, 1) # 時価総額(億)
-        row_data[6] = is_small
-        row_data[7] = is_inv_red
-        row_data[8] = f"{fin_data['inv_ratio']:.2%}"
+        row_data[3] = round(fin_data['nc_ratio_strict'], 2)   # 厳格NC比率
+        row_data[4] = is_nc_over_1
+        row_data[5] = is_nc_strict_over_1                     # 厳格NC1倍超
+        row_data[6] = is_exclude_fin
+        row_data[7] = round(fin_data['market_cap'] / to_oku, 1)
+        row_data[8] = is_small
+        row_data[9] = is_inv_red
+        row_data[10] = f"{fin_data['inv_ratio']:.2%}"
         
-        # 修正: 以下の財務数値を億円単位に変換
-        row_data[9] = round(fin_data['total_current_assets'] / to_oku, 1)  # 流動資産(億)
-        row_data[10] = round(fin_data['investment_securities'] / to_oku, 1) # 投資有価証券(億)
-        row_data[11] = round(fin_data['total_liabilities'] / to_oku, 1)     # 負債合計(億)
-        row_data[12] = round(fin_data['net_cash'] / to_oku, 1)              # ネットキャッシュ(億)
-        row_data[13] = round(fin_data['inventory'] / to_oku, 1)             # 棚卸資産(億)
+        # 財務数値 (億円)
+        row_data[11] = round(fin_data['total_current_assets'] / to_oku, 1)
+        row_data[12] = round(fin_data['investment_securities'] / to_oku, 1)
+        row_data[13] = round(fin_data['total_liabilities'] / to_oku, 1)
+        row_data[14] = round(fin_data['net_cash'] / to_oku, 1)
+        row_data[15] = round(fin_data['net_cash_strict'] / to_oku, 1) # 厳格NC(億)
+        row_data[16] = round(fin_data['inventory'] / to_oku, 1)
     
     else:
         row_data[0] = final_name if final_name != "取得失敗" else "データ取得失敗"
