@@ -170,9 +170,16 @@ def get_financial_data(ticker_code):
         return {'status': 'ERROR'}
 
 def main():
-    # 1. 休日判定
-    if is_market_closed():
+    # ▼▼▼ 修正箇所開始 ▼▼▼
+    # 環境変数 FORCE_RUN が "true" なら休日でも実行
+    force_run = os.environ.get("FORCE_RUN") == "true"
+
+    if force_run:
+        print("FORCE_RUN is enabled. Skipping holiday check.")
+    elif is_market_closed():
+        # 強制実行でなく、かつ休日の場合は終了
         return
+    # ▲▲▲ 修正箇所終了 ▲▲▲
 
     # 2. Secrets読み込み & GSpread認証
     secrets_json = os.environ.get(SECRETS_JSON_ENV)
