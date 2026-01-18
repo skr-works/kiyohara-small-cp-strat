@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import traceback
+import pandas as pd # タイムスタンプ計算用に明示インポート
 
 # --- 設定・定数 ---
 SECRETS_JSON_ENV = 'GCP_CREDENTIALS_JSON'
@@ -31,14 +32,16 @@ TSE_SECTORS = [
     "その他金融業", "不動産業", "サービス業"
 ]
 
-# ヘッダー定義 (厳格NC関連を追加)
+# ヘッダー定義 (並び順を変更: 安全性→収益性→カタリスト→フィルタ→在庫→生データ)
 HEADER = [
     '銘柄名', '業種', 
-    'NC比率', '厳格NC比率', 'NC比率1倍超', '厳格NC1倍超', 
-    '金融除外フラグ', '時価総額(億)', '小型株フラグ', 
-    '棚卸資産警告', '棚卸資産比率', 
+    'NC比率', '厳格NC比率', 'NC1倍超', '厳格NC1倍超',  # ①安全性
+    '実質PER', '配当利回り', '配当性向',             # ②収益性・③カタリスト (追加)
+    '金融除外フラグ', '時価総額(億)', '小型株フラグ', # ④フィルタ
+    '棚卸資産警告', '棚卸資産比率',                 # ⑤在庫リスク
     '流動資産(億)', '投資有価証券(億)', '負債合計(億)', 
-    'ネットキャッシュ(億)', '厳格NC(億)', '棚卸資産(億)'
+    'ネットキャッシュ(億)', '厳格NC(億)', '棚卸資産(億)',
+    '営業利益(億)'                                  # ⑥生データ (追加)
 ]
 
 # User-Agentリスト
@@ -74,7 +77,7 @@ def is_market_closed():
     return False
 
 def get_yahoo_jp_info(ticker_code):
-    """Yahoo!ファイナンス(JP)から銘柄名と業種を取得 (リスト照合方式に変更)"""
+    """Yahoo!ファイナンス(JP)から銘柄名と業種を取得"""
     url = f"https://finance.yahoo.co.jp/quote/{ticker_code}.T"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     
@@ -83,12 +86,11 @@ def get_yahoo_jp_info(ticker_code):
         res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
         res.raise_for_status()
         
-        # HTMLテキスト全体を取得
         res.encoding = res.apparent_encoding
         html = res.text
         soup = BeautifulSoup(html, 'html.parser')
 
-        # 1. 銘柄名取得 (Titleタグから抽出)
+        # 1. 銘柄名取得
         title_text = soup.title.string if soup.title else ""
         name = None
         if "【" in title_text:
@@ -96,10 +98,9 @@ def get_yahoo_jp_info(ticker_code):
         elif title_text:
             name = title_text.split("：")[0]
 
-        # 2. 業種取得 (HTML全体から東証33業種リストに含まれるものを探す)
+        # 2. 業種取得
         industry = "取得失敗"
         for candidate in TSE_SECTORS:
-            # HTML内に候補文字列が含まれているかチェック
             if candidate in html:
                 industry = candidate
                 break
@@ -111,7 +112,7 @@ def get_yahoo_jp_info(ticker_code):
         return None, "取得失敗"
 
 def get_financial_data(ticker_code, jp_name_failed=False):
-    """yfinanceから財務データを取得して計算"""
+    """yfinanceから財務データ(BS/PL/Div)を取得して計算"""
     target_ticker = f"{ticker_code}.T"
     yf_ticker = yf.Ticker(target_ticker)
     
@@ -124,10 +125,12 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         except Exception as e:
              return {'status': 'DATA_MISSING'}
 
-        # 時価総額
+        # 時価総額・現在株価 (fast_info利用)
         market_cap = None
+        current_price = None
         try:
             market_cap = yf_ticker.fast_info.market_cap
+            current_price = yf_ticker.fast_info.last_price
         except:
             pass
             
@@ -138,15 +141,15 @@ def get_financial_data(ticker_code, jp_name_failed=False):
             except:
                 pass
 
-        # BS取得
+        # --- 1. BS取得 (安全性指標) ---
         bs = yf_ticker.balance_sheet
         if bs.empty:
             return None
 
-        latest_date = bs.columns[0]
-        latest_bs = bs[latest_date]
+        latest_date_bs = bs.columns[0]
+        latest_bs = bs[latest_date_bs]
 
-        def get_val(key_list):
+        def get_val_bs(key_list):
             for k in key_list:
                 if k in latest_bs.index:
                     val = latest_bs[k]
@@ -155,18 +158,55 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                     return float(val)
             return None
 
-        # 'Total Current Assets' がない場合 'Current Assets' を探す
-        total_assets_curr = get_val(['Total Current Assets', 'Current Assets'])
-        
-        total_liab = get_val(['Total Liabilities Net Minority Interest', 'Total Liabilities'])
-        inventory = get_val(['Inventory']) or 0.0
+        total_assets_curr = get_val_bs(['Total Current Assets', 'Current Assets'])
+        total_liab = get_val_bs(['Total Liabilities Net Minority Interest', 'Total Liabilities'])
+        inventory = get_val_bs(['Inventory']) or 0.0
         
         inv_securities = 0.0
-        found_inv = get_val(['Investments', 'Other Short Term Investments', 'Long Term Investments', 'Other Investments'])
+        found_inv = get_val_bs(['Investments', 'Other Short Term Investments', 'Long Term Investments', 'Other Investments'])
         if found_inv is not None:
             inv_securities = found_inv
         
-        # 欠損チェック
+        # --- 2. PL取得 (実質PER用) ---
+        # 必須ではないので取れなくても進む
+        operating_income = 0.0
+        basic_eps = 0.0
+        
+        fin = yf_ticker.financials
+        if not fin.empty:
+            latest_date_pl = fin.columns[0]
+            latest_fin = fin[latest_date_pl]
+            
+            def get_val_pl(key_list):
+                for k in key_list:
+                    if k in latest_fin.index:
+                        val = latest_fin[k]
+                        if hasattr(val, "item"):
+                             if val != val: return 0.0
+                        return float(val)
+                return 0.0
+            
+            # 営業利益
+            operating_income = get_val_pl(['Operating Income', 'Operating Profit'])
+            # EPS (配当性向用)
+            basic_eps = get_val_pl(['Basic EPS'])
+
+        # --- 3. 配当取得 (カタリスト用) ---
+        # 過去1年間の配当合計を計算
+        annual_dividend = 0.0
+        try:
+            divs = yf_ticker.dividends
+            if not divs.empty:
+                # タイムゾーン考慮: 今から1年前
+                one_year_ago = pd.Timestamp.now(tz=divs.index.tz) - pd.DateOffset(years=1)
+                recent_divs = divs[divs.index >= one_year_ago]
+                annual_dividend = recent_divs.sum()
+        except:
+            pass
+
+        # --- 計算処理 ---
+        
+        # 欠損チェック (BS必須)
         if market_cap is None or total_assets_curr is None or total_liab is None:
             return {
                 'market_cap': market_cap,
@@ -174,22 +214,37 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                 'fallback_name': fallback_name
             }
 
-        # 計算
-        # 通常NetCash: 流動資産 + (投資有価証券 * 0.7) - 負債
+        # 安全性: NetCash
         net_cash = total_assets_curr + (inv_securities * 0.7) - total_liab
-        
-        # 厳格NetCash: (流動資産 - 棚卸資産) + (投資有価証券 * 0.7) - 負債
+        # 安全性: 厳格NetCash (棚卸除外)
         net_cash_strict = (total_assets_curr - inventory) + (inv_securities * 0.7) - total_liab
 
         # 比率計算
+        nc_ratio = 0
+        nc_ratio_strict = 0
         if market_cap:
             nc_ratio = net_cash / market_cap
             nc_ratio_strict = net_cash_strict / market_cap
-        else:
-            nc_ratio = 0
-            nc_ratio_strict = 0
-
+        
         inv_ratio = (inventory / total_assets_curr) if total_assets_curr else 0
+
+        # 収益性: 実質PER (CN-PER) = (時価総額 - 厳格NC) / (営業利益 * 0.65)
+        # ※営業利益が赤字、または0の場合は計算不可(None)とする
+        cn_per = None
+        op_after_tax = operating_income * 0.65
+        if op_after_tax > 0 and market_cap:
+            # 分子がマイナス(現金の方が多い)なら、CN-PERはマイナスになる(正しい挙動)
+            cn_per = (market_cap - net_cash_strict) / op_after_tax
+        
+        # カタリスト: 配当利回り & 性向
+        div_yield = 0.0
+        payout_ratio = 0.0
+        
+        if current_price and current_price > 0:
+            div_yield = annual_dividend / current_price
+            
+        if basic_eps > 0:
+            payout_ratio = annual_dividend / basic_eps
 
         return {
             'status': 'OK',
@@ -199,11 +254,16 @@ def get_financial_data(ticker_code, jp_name_failed=False):
             'inventory': inventory,
             'investment_securities': inv_securities,
             'net_cash': net_cash,
-            'net_cash_strict': net_cash_strict, # 追加
+            'net_cash_strict': net_cash_strict,
             'nc_ratio': nc_ratio,
-            'nc_ratio_strict': nc_ratio_strict, # 追加
+            'nc_ratio_strict': nc_ratio_strict,
             'inv_ratio': inv_ratio,
-            'fallback_name': fallback_name
+            'fallback_name': fallback_name,
+            # 追加項目
+            'cn_per': cn_per,
+            'div_yield': div_yield,
+            'payout_ratio': payout_ratio,
+            'operating_income': operating_income
         }
 
     except Exception as e:
@@ -242,28 +302,41 @@ def process_ticker_wrapper(code_raw):
         is_small = fin_data['market_cap'] <= MARKET_CAP_THRESHOLD
         is_inv_red = fin_data['inv_ratio'] >= INVENTORY_RATIO_THRESHOLD
         is_nc_over_1 = fin_data['nc_ratio'] >= 1.0
-        is_nc_strict_over_1 = fin_data['nc_ratio_strict'] >= 1.0 # 追加
+        is_nc_strict_over_1 = fin_data['nc_ratio_strict'] >= 1.0
         
         # 単位変換用 (億円)
         to_oku = 100_000_000
 
+        # 安全性
         row_data[2] = round(fin_data['nc_ratio'], 2)
-        row_data[3] = round(fin_data['nc_ratio_strict'], 2)   # 厳格NC比率
+        row_data[3] = round(fin_data['nc_ratio_strict'], 2)
         row_data[4] = is_nc_over_1
-        row_data[5] = is_nc_strict_over_1                     # 厳格NC1倍超
-        row_data[6] = is_exclude_fin
-        row_data[7] = round(fin_data['market_cap'] / to_oku, 1)
-        row_data[8] = is_small
-        row_data[9] = is_inv_red
-        row_data[10] = f"{fin_data['inv_ratio']:.2%}"
+        row_data[5] = is_nc_strict_over_1
+        
+        # 収益性・カタリスト (追加)
+        cn_per_val = fin_data['cn_per']
+        row_data[6] = round(cn_per_val, 1) if cn_per_val is not None else "-"
+        row_data[7] = f"{fin_data['div_yield']:.2%}"
+        row_data[8] = f"{fin_data['payout_ratio']:.1%}"
+
+        # フィルタ
+        row_data[9] = is_exclude_fin
+        row_data[10] = round(fin_data['market_cap'] / to_oku, 1)
+        row_data[11] = is_small
+        
+        # 在庫
+        row_data[12] = is_inv_red
+        # 修正: 文字列フォーマットを廃止し、数値をそのまま出力
+        row_data[13] = fin_data['inv_ratio']
         
         # 財務数値 (億円)
-        row_data[11] = round(fin_data['total_current_assets'] / to_oku, 1)
-        row_data[12] = round(fin_data['investment_securities'] / to_oku, 1)
-        row_data[13] = round(fin_data['total_liabilities'] / to_oku, 1)
-        row_data[14] = round(fin_data['net_cash'] / to_oku, 1)
-        row_data[15] = round(fin_data['net_cash_strict'] / to_oku, 1) # 厳格NC(億)
-        row_data[16] = round(fin_data['inventory'] / to_oku, 1)
+        row_data[14] = round(fin_data['total_current_assets'] / to_oku, 1)
+        row_data[15] = round(fin_data['investment_securities'] / to_oku, 1)
+        row_data[16] = round(fin_data['total_liabilities'] / to_oku, 1)
+        row_data[17] = round(fin_data['net_cash'] / to_oku, 1)
+        row_data[18] = round(fin_data['net_cash_strict'] / to_oku, 1)
+        row_data[19] = round(fin_data['inventory'] / to_oku, 1)
+        row_data[20] = round(fin_data['operating_income'] / to_oku, 1) # 追加
     
     else:
         row_data[0] = final_name if final_name != "取得失敗" else "データ取得失敗"
