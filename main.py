@@ -316,8 +316,10 @@ def process_ticker_wrapper(code_raw):
         # 収益性・カタリスト (追加)
         cn_per_val = fin_data['cn_per']
         row_data[6] = round(cn_per_val, 1) if cn_per_val is not None else "-"
-        row_data[7] = f"{fin_data['div_yield']:.2%}"
-        row_data[8] = f"{fin_data['payout_ratio']:.1%}"
+        
+        # 修正: 文字列フォーマットを廃止し、数値をそのまま出力
+        row_data[7] = fin_data['div_yield']
+        row_data[8] = fin_data['payout_ratio']
 
         # フィルタ
         row_data[9] = is_exclude_fin
