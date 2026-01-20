@@ -36,9 +36,9 @@ TSE_SECTORS = [
 HEADER = [
     '銘柄名', '業種', 
     'NC比率', '厳格NC比率', 'NC1倍超', '厳格NC1倍超',  # ①安全性
-    '実質PER', '配当利回り', '配当性向',             # ②収益性・③カタリスト (追加)
+    '実質PER', '配当利回り', '配当性向',              # ②収益性・③カタリスト (追加)
     '金融除外フラグ', '時価総額(億)', '小型株フラグ', # ④フィルタ
-    '棚卸資産警告', '棚卸資産比率',                 # ⑤在庫リスク
+    '棚卸資産警告', '棚卸資産比率',                  # ⑤在庫リスク
     '流動資産(億)', '投資有価証券(億)', '負債合計(億)', 
     'ネットキャッシュ(億)', '厳格NC(億)', '棚卸資産(億)',
     '営業利益(億)'                                  # ⑥生データ (追加)
@@ -121,19 +121,28 @@ def get_financial_data(ticker_code, jp_name_failed=False):
     try:
         # 404エラーチェック
         try:
-             _ = yf_ticker.fast_info.currency
+            _ = yf_ticker.fast_info.currency
         except Exception as e:
              return {'status': 'DATA_MISSING'}
 
-        # 時価総額・現在株価 (fast_info利用)
+        # 【対策1】時価総額・現在株価のリトライ取得
+        # アクセス拒否(429)対策として、失敗時にWaitを入れて再試行する
         market_cap = None
         current_price = None
-        try:
-            market_cap = yf_ticker.fast_info.market_cap
-            current_price = yf_ticker.fast_info.last_price
-        except:
-            pass
-            
+        
+        for i in range(3): # 最大3回リトライ
+            try:
+                # バージョン揺れ対応
+                if hasattr(yf_ticker, "fast_info"):
+                    market_cap = yf_ticker.fast_info.market_cap
+                    current_price = yf_ticker.fast_info.last_price
+                
+                if market_cap is not None:
+                    break
+            except:
+                pass
+            time.sleep(1.0 + i) # 失敗したら少し待つ
+
         # 英語名フォールバック
         if jp_name_failed:
             try:
@@ -142,24 +151,40 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                 pass
 
         # --- 1. BS取得 (安全性指標) ---
-        bs = yf_ticker.balance_sheet
-        if bs.empty:
+        # 【対策3】年次データがない場合、四半期データへの切り替え
+        bs = None
+        try:
+            bs = yf_ticker.balance_sheet
+            if bs is None or bs.empty:
+                bs = yf_ticker.quarterly_balance_sheet
+        except:
+            pass
+
+        if bs is None or bs.empty:
             return None
 
         latest_date_bs = bs.columns[0]
         latest_bs = bs[latest_date_bs]
 
+        # 【対策2】データ項目名の「ゆらぎ」対応（柔軟性）
+        # インデックスをすべて小文字化・空白除去してマッピングを作成
+        bs_idx_map = {str(k).strip().lower(): k for k in latest_bs.index}
+
         def get_val_bs(key_list):
             for k in key_list:
-                if k in latest_bs.index:
-                    val = latest_bs[k]
+                # 検索キーも正規化して探す
+                search_key = str(k).strip().lower()
+                if search_key in bs_idx_map:
+                    real_key = bs_idx_map[search_key]
+                    val = latest_bs[real_key]
                     if hasattr(val, "item"): 
-                        if val != val: return None
+                        if val != val: return None # NaN check
+                        return float(val)
                     return float(val)
             return None
 
         total_assets_curr = get_val_bs(['Total Current Assets', 'Current Assets'])
-        total_liab = get_val_bs(['Total Liabilities Net Minority Interest', 'Total Liabilities'])
+        total_liab = get_val_bs(['Total Liabilities Net Minority Interest', 'Total Liabilities', 'Total Liab'])
         inventory = get_val_bs(['Inventory']) or 0.0
         
         inv_securities = 0.0
@@ -168,21 +193,30 @@ def get_financial_data(ticker_code, jp_name_failed=False):
             inv_securities = found_inv
         
         # --- 2. PL取得 (実質PER用) ---
-        # 必須ではないので取れなくても進む
         operating_income = 0.0
         basic_eps = 0.0
         
         fin = yf_ticker.financials
-        if not fin.empty:
+        if fin is None or fin.empty:
+            # PLも四半期へフォールバック
+            fin = yf_ticker.quarterly_financials
+
+        if fin is not None and not fin.empty:
             latest_date_pl = fin.columns[0]
             latest_fin = fin[latest_date_pl]
             
+            # PL用のゆらぎ対応マップ
+            pl_idx_map = {str(k).strip().lower(): k for k in latest_fin.index}
+
             def get_val_pl(key_list):
                 for k in key_list:
-                    if k in latest_fin.index:
-                        val = latest_fin[k]
+                    search_key = str(k).strip().lower()
+                    if search_key in pl_idx_map:
+                        real_key = pl_idx_map[search_key]
+                        val = latest_fin[real_key]
                         if hasattr(val, "item"):
                              if val != val: return 0.0
+                             return float(val)
                         return float(val)
                 return 0.0
             
@@ -271,6 +305,10 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         return {'status': 'ERROR'}
 
 def process_ticker_wrapper(code_raw):
+    # 【対策4】待機時間（スリープ）の配置戦略
+    # 処理開始時に必ずWaitを入れることで、並列処理時のアクセス集中を緩和する
+    time.sleep(random.uniform(0.1, 1.1))
+
     # 文字列変換と ".0" の除去
     code_str = str(code_raw).strip()
     if code_str.endswith(".0"):
