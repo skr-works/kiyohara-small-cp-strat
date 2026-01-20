@@ -54,8 +54,9 @@ USER_AGENTS = [
 # Session作成
 def create_session():
     session = requests.Session()
+    # 修正: totalを5回に増加、backoff_factorを2に増加（待機時間をより長く確保）
     retry = Retry(
-        total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset(["GET"]),
+        total=5, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset(["GET"]),
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
@@ -81,35 +82,47 @@ def get_yahoo_jp_info(ticker_code):
     url = f"https://finance.yahoo.co.jp/quote/{ticker_code}.T"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     
-    try:
-        time.sleep(random.uniform(0.05, 0.5))
-        res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
-        res.raise_for_status()
-        
-        res.encoding = res.apparent_encoding
-        html = res.text
-        soup = BeautifulSoup(html, 'html.parser')
+    # 修正: スクレイピング部分に強力なリトライループを追加
+    # エラーが出ても、最大3回まで「長い休憩」を挟んで再挑戦する
+    for i in range(3):
+        try:
+            # 修正: 待機時間を 0.05-0.5秒 → 1.0-2.0秒 に大幅延長
+            time.sleep(random.uniform(1.0, 2.0))
+            
+            res = _HTTP_SESSION.get(url, headers=headers, timeout=10)
+            res.raise_for_status()
+            
+            res.encoding = res.apparent_encoding
+            html = res.text
+            soup = BeautifulSoup(html, 'html.parser')
 
-        # 1. 銘柄名取得
-        title_text = soup.title.string if soup.title else ""
-        name = None
-        if "【" in title_text:
-            name = title_text.split("【")[0]
-        elif title_text:
-            name = title_text.split("：")[0]
+            # 1. 銘柄名取得
+            title_text = soup.title.string if soup.title else ""
+            name = None
+            if "【" in title_text:
+                name = title_text.split("【")[0]
+            elif title_text:
+                name = title_text.split("：")[0]
 
-        # 2. 業種取得
-        industry = "取得失敗"
-        for candidate in TSE_SECTORS:
-            if candidate in html:
-                industry = candidate
-                break
+            # 2. 業種取得
+            industry = "取得失敗"
+            for candidate in TSE_SECTORS:
+                if candidate in html:
+                    industry = candidate
+                    break
 
-        return name.strip() if name else None, industry
+            return name.strip() if name else None, industry
 
-    except Exception as e:
-        print(f"Scraping Error for {ticker_code}: {e}")
-        return None, "取得失敗"
+        except Exception as e:
+            # 最後のリトライでも失敗した場合のみエラーを出力
+            if i == 2:
+                print(f"Scraping Error for {ticker_code}: {e}")
+                return None, "取得失敗"
+            else:
+                # 修正: エラー時は 5〜10秒 待機してサーバー負荷が下がるのを待つ
+                time.sleep(random.uniform(5.0, 10.0))
+
+    return None, "取得失敗"
 
 def get_financial_data(ticker_code, jp_name_failed=False):
     """yfinanceから財務データ(BS/PL/Div)を取得して計算"""
@@ -130,7 +143,8 @@ def get_financial_data(ticker_code, jp_name_failed=False):
         market_cap = None
         current_price = None
         
-        for i in range(3): # 最大3回リトライ
+        # 修正: 最大リトライ回数を8回に増加（より粘り強く）
+        for i in range(8): 
             try:
                 # バージョン揺れ対応
                 if hasattr(yf_ticker, "fast_info"):
@@ -141,7 +155,8 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                     break
             except:
                 pass
-            time.sleep(1.0 + i) # 失敗したら少し待つ
+            # 修正: 待機時間を延長 (2.0秒 + 回数分)
+            time.sleep(2.0 + i) 
 
         # 英語名フォールバック
         if jp_name_failed:
@@ -306,8 +321,9 @@ def get_financial_data(ticker_code, jp_name_failed=False):
 
 def process_ticker_wrapper(code_raw):
     # 【対策4】待機時間（スリープ）の配置戦略
-    # 処理開始時に必ずWaitを入れることで、並列処理時のアクセス集中を緩和する
-    time.sleep(random.uniform(0.1, 1.1))
+    # 修正: 待機時間を 2.0〜4.0秒 に拡大 (平均3.0秒)
+    # これにより全体の処理時間が約50〜60分程度になり、エラー率を劇的に下げる
+    time.sleep(random.uniform(2.0, 4.0))
 
     # 文字列変換と ".0" の除去
     code_str = str(code_raw).strip()
