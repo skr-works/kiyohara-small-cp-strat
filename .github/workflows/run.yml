@@ -3,7 +3,7 @@ name: Screener Routine
 on:
   schedule:
     # JST 15:32 (UTC 06:32) Mon-Fri
-    - cron: '32 6 * * 1-5'
+    - cron: '11 7 * * 1-5'
   workflow_dispatch:
     inputs:
       force_run:
