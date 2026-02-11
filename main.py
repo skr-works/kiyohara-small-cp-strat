@@ -22,6 +22,13 @@ MARKET_CAP_THRESHOLD = 500 * 100_000_000
 INVENTORY_RATIO_THRESHOLD = 0.3
 FINANCE_KEYWORDS = ["銀行業", "保険業", "証券", "商品先物", "金融業"]
 
+# ==========================================
+# ★ 設定: B/C列のスクレイピング・入力切替
+# True : スクレイピングを行い、B列(銘柄名)・C列(業種)から更新 (低速)
+# False: スクレイピングを行わず、D列(NC比率)から更新 (高速・30分短縮)
+# ==========================================
+UPDATE_BC_WITH_SCRAPING = False
+
 # 東証33業種リスト
 TSE_SECTORS = [
     "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
@@ -36,9 +43,9 @@ TSE_SECTORS = [
 HEADER = [
     '銘柄名', '業種', 
     'NC比率', '厳格NC比率', 'NC1倍超', '厳格NC1倍超',  # ①安全性
-    '実質PER', '配当利回り', '配当性向',              # ②収益性・③カタリスト (追加)
+    '実質PER', '配当利回り', '配当性向',               # ②収益性・③カタリスト (追加)
     '金融除外フラグ', '時価総額(億)', '小型株フラグ', # ④フィルタ
-    '棚卸資産警告', '棚卸資産比率',                  # ⑤在庫リスク
+    '棚卸資産警告', '棚卸資産比率',                   # ⑤在庫リスク
     '流動資産(億)', '投資有価証券(億)', '負債合計(億)', 
     'ネットキャッシュ(億)', '厳格NC(億)', '棚卸資産(億)',
     '営業利益(億)'                                  # ⑥生データ (追加)
@@ -321,21 +328,34 @@ def get_financial_data(ticker_code, jp_name_failed=False):
 
 def process_ticker_wrapper(code_raw):
     # 【対策4】待機時間（スリープ）の配置戦略
-    # 修正: 待機時間を 2.0〜4.0秒 に拡大 (平均3.0秒)
-    # これにより全体の処理時間が約50〜60分程度になり、エラー率を劇的に下げる
-    time.sleep(random.uniform(2.0, 4.0))
-
-    # 文字列変換と ".0" の除去
-    code_str = str(code_raw).strip()
-    if code_str.endswith(".0"):
-        code_str = code_str[:-2]
-
-    if not code_str:
-        return [""] * len(HEADER)
+    # 修正: 設定がONの場合のみ、待機とスクレイピングを実行
     
-    # A. Yahoo JP スクレイピング
-    name_jp, industry_jp = get_yahoo_jp_info(code_str)
+    name_jp = None
+    industry_jp = "-"
     
+    if UPDATE_BC_WITH_SCRAPING:
+        # 待機時間を 2.0〜4.0秒 に拡大
+        time.sleep(random.uniform(2.0, 4.0))
+        
+        # 文字列変換と ".0" の除去
+        code_str = str(code_raw).strip()
+        if code_str.endswith(".0"):
+            code_str = code_str[:-2]
+
+        if not code_str:
+            return [""] * len(HEADER)
+        
+        # A. Yahoo JP スクレイピング
+        name_jp, industry_jp = get_yahoo_jp_info(code_str)
+    else:
+        # OFFの場合はスクレイピング関連をスキップ
+        code_str = str(code_raw).strip()
+        if code_str.endswith(".0"):
+            code_str = code_str[:-2]
+        if not code_str:
+            # OFF時も要素数は合わせる必要があるが、戻り値で調整する
+             return [""] * (len(HEADER) - 2)
+
     # B. yfinance データ取得
     fin_data = get_financial_data(code_str, jp_name_failed=(name_jp is None))
     
@@ -398,7 +418,12 @@ def process_ticker_wrapper(code_raw):
         row_data[0] = final_name if final_name != "取得失敗" else "データ取得失敗"
         row_data[2] = "ERROR/MISSING"
 
-    return row_data
+    # 設定に応じて戻り値を変更
+    if UPDATE_BC_WITH_SCRAPING:
+        return row_data
+    else:
+        # B, C列(index 0, 1)を除外して、NC比率以降を返す
+        return row_data[2:]
 
 def main():
     force_run = os.environ.get("FORCE_RUN") == "true"
@@ -428,10 +453,21 @@ def main():
         print("No tickers found in column A.")
         return
 
-    header_range = f"B1:{chr(65 + len(HEADER))}1"
-    worksheet.update(range_name=header_range, values=[HEADER])
+    # 修正: ヘッダー書き込み位置の調整
+    if UPDATE_BC_WITH_SCRAPING:
+        header_range = f"B1:{chr(65 + len(HEADER))}1"
+        worksheet.update(range_name=header_range, values=[HEADER])
+    else:
+        # D列('NC比率')以降のヘッダーのみ更新
+        # HEADER[2]は'NC比率'。B, Cをスキップするので D1から開始。
+        # A(1), B(2), C(3), D(4) -> len(HEADER)-2 列分
+        # HEADER[2:] を書き込む
+        partial_header = HEADER[2:]
+        # D列は chr(68)
+        header_range = f"D1:{chr(68 + len(partial_header) - 1)}1"
+        worksheet.update(range_name=header_range, values=[partial_header])
 
-    print(f"Start processing {len(tickers)} tickers...")
+    print(f"Start processing {len(tickers)} tickers... (Scraping: {UPDATE_BC_WITH_SCRAPING})")
 
     BATCH_SIZE = 50
     total_tickers = len(tickers)
@@ -451,7 +487,15 @@ def main():
         if batch_rows:
             start_row = current_index + 2
             end_row = start_row + len(batch_rows) - 1
-            data_range = f"B{start_row}:{chr(65 + len(HEADER))}{end_row}"
+            
+            # 修正: データ書き込み位置の調整
+            if UPDATE_BC_WITH_SCRAPING:
+                # B列から全て
+                data_range = f"B{start_row}:{chr(65 + len(HEADER))}{end_row}"
+            else:
+                # D列から、NC比率以降のみ
+                # batch_rowsの中身はすでに process_ticker_wrapper で短くなっている
+                data_range = f"D{start_row}:{chr(68 + len(batch_rows[0]) - 1)}{end_row}"
             
             try:
                 worksheet.update(range_name=data_range, values=batch_rows)
