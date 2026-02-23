@@ -77,7 +77,7 @@ def is_market_closed():
         print(f"Today is weekend ({today.strftime('%A')}). Exiting.")
         return True
     if jpholiday.is_holiday(today):
-        print(f"Today is holiday ({jpholiday.holiday_name(today)}). Exiting.")
+        print(f"Today is holiday ({jpholiday.is_holiday_name(today)}). Exiting.")
         return True
     if (today.month == 12 and today.day == 31) or (today.month == 1 and today.day <= 3):
         print("Today is New Year holidays. Exiting.")
