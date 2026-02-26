@@ -139,22 +139,17 @@ def get_financial_data(ticker_code, jp_name_failed=False):
     fallback_name = None
 
     try:
-        # 404エラーチェック
-        try:
-            _ = yf_ticker.fast_info.currency
-        except Exception as e:
-             return {'status': 'DATA_MISSING'}
+        # 即死トラップだった 404エラーチェック のブロックを完全に削除
 
         # 【対策1】時価総額・現在株価のリトライ取得
-        # アクセス拒否(429)対策として、失敗時にWaitを入れて再試行する
         market_cap = None
         current_price = None
         
-        # 修正: 最大リトライ回数を8回に増加（より粘り強く）
         for i in range(8): 
             try:
                 # バージョン揺れ対応
                 if hasattr(yf_ticker, "fast_info"):
+                    # ここでエラーが出ても except に飛んで正しくリトライ（待機）される
                     market_cap = yf_ticker.fast_info.market_cap
                     current_price = yf_ticker.fast_info.last_price
                 
@@ -162,8 +157,13 @@ def get_financial_data(ticker_code, jp_name_failed=False):
                     break
             except:
                 pass
-            # 修正: 待機時間を延長 (2.0秒 + 回数分)
+            
+            # エラー時は待機して再試行
             time.sleep(2.0 + i) 
+
+        # 8回リトライしてもダメだった場合のみ「データなし」と判定する
+        if market_cap is None:
+             return {'status': 'DATA_MISSING', 'fallback_name': fallback_name}
 
         # 英語名フォールバック
         if jp_name_failed:
