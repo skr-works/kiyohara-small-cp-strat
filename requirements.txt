@@ -5,3 +5,4 @@ requests
 beautifulsoup4
 jpholiday
 pandas
+certifi>=2026.10.19
